@@ -1,0 +1,22 @@
+Copyright 2025 MetaX Integrated Circuits (Shanghai) Co.,Ltd.
+Please see the LICENSE for the license for this project.
+
+The project contains third-party components with separate copyright notices and license terms. Your use of the source code for the these third-party components are subject to the terms and conditions of their licenses. 
+
+The following files may have been Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. in 2025.  
+
+metax_modifications/chatsim/agents/asset_select_agent.py                             
+metax_modifications/chatsim/agents/deletion_agent.py                                                                     
+metax_modifications/chatsim/agents/motion_agent.py                                   
+metax_modifications/chatsim/agents/project_manager.py                                
+metax_modifications/chatsim/agents/view_adjust_agent.py                              
+metax_modifications/chatsim/foreground/Blender/utils/blender_utils/render/render.py  
+metax_modifications/chatsim/foreground/motion_tools/placement_and_motion.py          
+metax_modifications/chatsim/foreground/motion_tools/placement_iterative.py           
+metax_modifications/chatsim/foreground/motion_tools/tools.py                         
+metax_modifications/chatsim/scene.py                                                                                    
+metax_modifications/data_utils/convert_to_waymo_script.py                                                            
+metax_modifications/data_utils/process_waymo.py                                      
+metax_modifications/data_utils/process_waymo_script.py                               
+metax_modifications/main.py                                                          
+metax_modifications/requirements.txt                                                 

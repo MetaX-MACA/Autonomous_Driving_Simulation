@@ -1,0 +1,416 @@
+# 2025 - Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. All Rights Reserved.
+import argparse
+import os
+import glob
+import numpy as np
+from tqdm import tqdm
+from waymo_open_dataset import dataset_pb2 as open_dataset
+from waymo_open_dataset.utils import frame_utils
+import imageio
+import tensorflow.compat.v1 as tf
+tf.enable_eager_execution()
+import pickle
+from collections import defaultdict
+from copy import deepcopy
+import cv2
+import shutil
+import open3d as o3d
+import copy
+
+# 是否保存相机内参
+SAVE_INTRINSIC = True
+# 是否将所有的跟踪信息保存在一个文件中
+SINGLE_TRACK_INFO_FILE = True
+DEBUG = False
+MULTIPLE_DIRS = False
+
+CAMERAS = {
+    'FRONT': 0,
+    'FRONT_LEFT': 1,
+    'FRONT_RIGHT': 2,
+}
+
+def parse_args():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('--tfrecord_dir', type=str)
+    parser.add_argument('--nerf_data_dir', type=str)
+    parser.add_argument('-nd', '--no_data', action='store_true')
+    parser.add_argument('--frame_nums', type=int, default=60)
+    parser.add_argument('--start_frame', type=int, default=0)
+
+    return parser.parse_args()
+
+
+def invert_transformation(rot, t):
+    """
+    计算变换矩阵的逆
+    """
+    t = np.matmul(-rot.T, t)
+    inv_translation = np.concatenate([rot.T, t[:, None]], axis=1)
+    return np.concatenate([inv_translation, np.array([[0., 0., 0., 1.]])])
+
+
+def extract_label_fields(l,dims):
+    """
+    从标注数据中提取重要的字段，如目标的位置、尺寸等
+    """
+    assert dims in [2,3]
+    label_dict = {'c_x':l.box.center_x,'c_y':l.box.center_y,'width':l.box.width,'length':l.box.length,'type':l.type}
+    if dims==3:
+        label_dict['c_z'] = l.box.center_z
+        label_dict['height'] = l.box.height
+        label_dict['heading'] = l.box.heading
+    return label_dict
+
+
+def read_intrinsic(intrinsic_params_vector):
+    """
+    将相机的内参向量转化为字典，焦距、主点和畸变系数的字典
+    """
+    return dict(zip(['f_u', 'f_v', 'c_u', 'c_v', 'k_1', 'k_2', 'p_1', 'p_2', 'k_3'], intrinsic_params_vector))
+
+
+def get_shutter(filename, save_path, start_frame = 0, end_frame = 40, normalize=True):
+    """
+    从TFRecord文件中提取每帧图像的快门时间，并保存为文件，支持对时间归一化处理
+    """
+    if not os.path.exists(save_path):
+        os.mkdir(save_path)
+
+    dataset = tf.data.TFRecordDataset(filename, compression_type='')
+    dataset_iter = list(dataset.as_numpy_iterator())
+
+    frame = open_dataset.Frame()
+    print(f"{filename}")
+    shutter_save = []
+    for i, frame_data in tqdm(enumerate(dataset_iter)):
+        if (i < start_frame) or (i >= end_frame):
+            continue
+        frame.ParseFromString(frame_data)
+        for image in frame.images:
+            if open_dataset.CameraName.Name.Name(image.name) in CAMERAS:
+                shutter_save.append(image.shutter)
+    shutter_save = np.array(shutter_save)
+
+    if normalize:
+        mean = shutter_save.mean()
+        std = shutter_save.std()
+
+        shutter_save = (shutter_save - mean) / std
+
+    for i in range(len(shutter_save)):
+        filename = f"{save_path}/{str(i).zfill(3)}.txt"
+        with open(filename, 'w') as f:
+            f.write(str(shutter_save[i]))
+
+
+def main():
+    """
+    处理TFRecord文件，逐帧解析数据，提取相机图像、点云数据、相机内外参、激光雷达点云、车辆位姿、地图信息等
+    处理完成后，将这些数据保存为图片（png格式）、点云文件（ply格式）、以及其他信息文件（如相机内外参矩阵等）
+    """
+    args = parse_args()
+    tfrecord_path = args.tfrecord_dir
+    export_data = not args.no_data
+    scene_name = tfrecord_path.split('/')[-1].split('.')[0]
+    scene_name = scene_name[scene_name.find('segment'):]
+    saving_dir = os.path.join(args.nerf_data_dir, scene_name)
+
+    if not isinstance(tfrecord_path, list):   
+        tfrecord_path = [tfrecord_path]
+    if not os.path.isdir(saving_dir):   
+        os.makedirs(saving_dir, exist_ok=True)
+
+    isotropic_focal = lambda intrinsic_dict: intrinsic_dict['f_u']==intrinsic_dict['f_v']
+
+    if SINGLE_TRACK_INFO_FILE:
+        tracking_info = {}
+
+    print('Processing file ', tfrecord_path)
+
+    if not os.path.isdir(os.path.join(saving_dir, 'images_all')):   
+        os.mkdir(os.path.join(saving_dir, 'images_all'))
+    if not os.path.isdir(os.path.join(saving_dir, 'images')):   
+        os.mkdir(os.path.join(saving_dir, 'images'))
+    if not os.path.isdir(os.path.join(saving_dir, 'point_cloud')):   
+        os.mkdir(os.path.join(saving_dir, 'point_cloud'))
+    if not SINGLE_TRACK_INFO_FILE:
+        if not os.path.isdir(os.path.join(saving_dir, 'tracking')):   
+            os.mkdir(os.path.join(saving_dir, 'tracking'))
+            
+    dataset = tf.data.TFRecordDataset(tfrecord_path, compression_type='')
+    frames = []
+    for f_num, data in enumerate(tqdm(dataset)):
+        frame = open_dataset.Frame()
+        frames.append(frame)
+        frame.ParseFromString(bytearray(data.numpy()))
+        pose = np.zeros([len(frame.images), 4, 4])
+        im_paths = {}
+        pcd_paths = {}
+        if SAVE_INTRINSIC:
+            intrinsic = np.zeros([len(frame.images),9])
+        extrinsic = np.zeros_like(pose)
+        width,height,camera_labels = np.zeros([len(frame.images)]),np.zeros([len(frame.images)]),defaultdict(dict)
+        for im in frame.images:
+            saving_name = os.path.join(saving_dir, 'images_all','%03d_%s.png'%(f_num,open_dataset.CameraName.Name.Name(im.name)))
+            if not DEBUG and export_data:
+                im_array = tf.image.decode_jpeg(im.image).numpy()
+                imageio.imwrite(saving_name, im_array, compress_level=3)
+            pose[im.name-1, :, :] = np.reshape(im.pose.transform, [4, 4]) # ego vehicle pose (ego vehicle to world) 每个相机下车辆的全局位姿
+            im_paths[im.name] = saving_name
+            extrinsic[im.name-1, :, :] = np.reshape(frame.context.camera_calibrations[im.name-1].extrinsic.transform, [4, 4]) # cam to ego vehicle 相机外参
+            if SAVE_INTRINSIC:
+                intrinsic[im.name-1, :] = frame.context.camera_calibrations[im.name-1].intrinsic
+                assert isotropic_focal(read_intrinsic(intrinsic[im.name-1, :])),'Unexpected difference between f_u and f_v.'
+            width[im.name-1] = frame.context.camera_calibrations[im.name-1].width
+            height[im.name-1] = frame.context.camera_calibrations[im.name-1].height
+            for obj_label in frame.projected_lidar_labels[im.name-1].labels:
+                camera_labels[im.name][obj_label.id.replace('_'+open_dataset.CameraName.Name.Name(im.name),'')] = extract_label_fields(obj_label,2)
+        # Extract point cloud data from stored range images
+        laser_calib = np.zeros([len(frame.lasers), 4,4])
+        if export_data:
+            (range_images, camera_projections, seg_labels, range_image_top_pose) = \
+                frame_utils.parse_range_image_and_camera_projection(frame)
+            points, cp_points = frame_utils.convert_range_image_to_point_cloud(frame,
+                                                                            range_images,
+                                                                            camera_projections,
+                                                                            range_image_top_pose)
+        else:
+            points = np.empty([len(frame.lasers), 1])
+
+        laser_mapping = {}
+        for (laser, pts) in zip(frame.lasers, points):
+            saving_name = os.path.join(saving_dir, 'point_cloud', '%03d_%s.ply' % (f_num, open_dataset.LaserName.Name.Name(laser.name)))
+            if export_data and f_num == 0:
+                pcd = o3d.geometry.PointCloud()
+                pcd.points = o3d.utility.Vector3dVector(pts)
+                o3d.io.write_point_cloud(saving_name, pcd)
+            calib_id = int(np.where(np.array([cali.name for cali in frame.context.laser_calibrations[:5]]) == laser.name)[0])
+            laser_calib[laser.name-1, :, :] = np.reshape(frame.context.laser_calibrations[calib_id].extrinsic.transform, [4, 4])
+            pcd_paths[laser.name] = saving_name
+            laser_mapping.update({open_dataset.LaserName.Name.Name(laser.name): calib_id})
+
+        if 'intrinsic' in tracking_info:
+            assert np.all(tracking_info['intrinsic']==intrinsic) and np.all(tracking_info['width']==width) and np.all(tracking_info['height']==height)
+        else:
+            tracking_info['intrinsic'],tracking_info['width'],tracking_info['height'] = intrinsic,width,height
+        dict_2_save = {'per_cam_veh_pose':pose, 'cam2veh':extrinsic, 'im_paths':im_paths, 'width':width, 'height':height,
+                    'veh2laser':laser_calib, 'pcd_paths': pcd_paths, 'focal': intrinsic[:, 0]}
+        if SAVE_INTRINSIC and SINGLE_TRACK_INFO_FILE:
+            dict_2_save['intrinsic'] = intrinsic
+        lidar_labels = {}
+        for obj_label in frame.laser_labels:
+            lidar_labels[obj_label.id] = extract_label_fields(obj_label,3)
+
+        dict_2_save['lidar_labels'] = lidar_labels
+        dict_2_save['camera_labels'] = camera_labels
+        dict_2_save['veh_pose'] = np.reshape(frame.pose.transform,[4,4]) # vehicle pose, ego to world 车辆的全局位姿
+        dict_2_save['timestamp'] = frame.timestamp_micros
+
+        tracking_info[(0,f_num)] = deepcopy(dict_2_save)
+
+    with open(os.path.join(saving_dir, 'tracking_info%s.pkl'%('_debug' if DEBUG else '')), 'wb') as f:
+        pickle.dump(tracking_info, f)
+
+    transform = np.reshape(np.array(frames[args.start_frame].pose.transform), [4, 4])
+    transform = np.linalg.inv(transform)
+    road_edges = []
+    lanes = []   
+    for i in range(len(frames[0].map_features)):
+        # centerline
+        if len(frames[0].map_features[i].lane.polyline) > 0:
+            curr_lane = []
+            for node in frames[0].map_features[i].lane.polyline:
+                node_position = np.ones(4)
+                node_position[0] = node.x
+                node_position[1] = node.y
+                node_position[2] = node.z
+                curr_lane.append(node_position)
+            curr_lane = np.stack(curr_lane)
+            curr_lane = np.transpose(np.matmul(transform, np.transpose(curr_lane)))[:, 0:3]
+            lanes.append(curr_lane)
+        # boundary
+        if len(frames[0].map_features[i].road_edge.polyline) > 0:
+            curr_edge = []
+            for node in frames[0].map_features[i].road_edge.polyline:
+                node_position = np.ones(4)
+                node_position[0] = node.x
+                node_position[1] = node.y
+                node_position[2] = node.z
+                curr_edge.append(node_position)
+            curr_edge = np.stack(curr_edge)
+            curr_edge = np.transpose(np.matmul(transform, np.transpose(curr_edge)))[:, 0:3]
+            road_edges.append(curr_edge)
+
+    x_min = -30
+    x_max = 50
+    y_min = -20
+    y_max = 20
+    cropped_road_edges = []
+    for edge in road_edges:
+        new_road_edge = []
+        for i in range(edge.shape[0]):
+            if edge[i,0] < x_min or edge[i,0] > x_max or edge[i,1] < y_min or edge[i,1] > y_max:
+                continue
+            new_road_edge.append(edge[i])
+        if len(new_road_edge) > 0:
+            new_road_edge = np.stack(new_road_edge)
+            cropped_road_edges.append(new_road_edge)
+
+    cropped_lanes = []
+    for lane in lanes:
+        new_lane = []
+        for i in range(lane.shape[0]):
+            if lane[i,0] < x_min or lane[i,0] > x_max or lane[i,1] < y_min or lane[i,1] > y_max:
+                continue
+            new_lane.append(lane[i])
+        if len(new_lane) > 0:
+            new_lane = np.stack(new_lane)
+            cropped_lanes.append(new_lane)
+    output_map = {"centerline":cropped_lanes,"boundary":cropped_road_edges}
+
+    with open(os.path.join(saving_dir, 'map.pkl'), 'wb') as f:
+        pickle.dump(output_map, f)
+                
+    with open(os.path.join(saving_dir, 'tracking_info.pkl'), 'rb') as file:
+        data = pickle.load(file)
+
+    all_veh_poses_per_cam = []
+    all_cam2veh = []
+    all_veh2world = []
+    all_intrinsic_matrices = []
+    all_distortions = []
+    for i in range(args.start_frame, args.start_frame + args.frame_nums):
+        frame = data[(0, i)]
+        all_veh_poses_per_cam.append(frame['per_cam_veh_pose'][None, ...])
+        all_cam2veh.append(frame['cam2veh'][None, ...])
+        all_veh2world.append(np.stack([frame['veh_pose'] for j in range(len(CAMERAS))])[None, ...])
+
+        intrinsic_and_dist = frame['intrinsic'] # (5, 9) 9 includes ['f_u', 'f_v', 'c_u', 'c_v', 'k_1', 'k_2', 'p_1', 'p_2', 'k_3']
+        
+        intrinsic_matrix = np.stack(
+                                [np.array([[intrinsic_and_dist[j, 0], 0, intrinsic_and_dist[j, 2]],
+                                          [0, intrinsic_and_dist[j, 1], intrinsic_and_dist[j, 3]],
+                                          [0, 0, 1]]) 
+                                for j in range(len(CAMERAS))] 
+                            ) # [3, 3, 3]
+        all_intrinsic_matrices.append(intrinsic_matrix)
+
+        distortion = np.stack(
+                        [np.array([intrinsic_and_dist[j, 4], intrinsic_and_dist[j, 5], intrinsic_and_dist[j, 6], intrinsic_and_dist[j, 7]])
+                            for j in range(len(CAMERAS))]
+                     ) # [3, 4]
+        all_distortions.append(distortion)
+
+    all_veh_poses_per_cam = np.concatenate(all_veh_poses_per_cam, 0)
+    all_cam2veh = np.concatenate(all_cam2veh, 0)
+    all_veh2world = np.concatenate(all_veh2world, 0)
+    all_intrinsic_matrices = np.concatenate(all_intrinsic_matrices)
+    all_distortions = np.concatenate(all_distortions)
+
+    extrinsics = []
+    all_vehi2veh0 = []
+
+    veh2world_per_cam = all_veh_poses_per_cam[:, 0] # ego vehicle to world 每个相机下车辆的全局位姿
+    world2veh_per_cam = np.stack([invert_transformation(v[:3, :3], v[:3, 3]) for v in veh2world_per_cam])
+    print(world2veh_per_cam.shape)
+    cam2veh = all_cam2veh[:, 0] # cam to ego vehicle 相机外参
+    veh2world = all_veh2world[:, 0] # ego to world 车辆的全局位姿
+
+    cam2veh = np.matmul(world2veh_per_cam, np.matmul(veh2world, cam2veh))
+
+    veh2world_per_cam_0 = copy.deepcopy(veh2world_per_cam[0]) # front 主视角相机的全局位姿
+    # veh2world_per_cam_0 = copy.deepcopy(all_veh2world[0, 0])
+    world2veh_per_cam_0 = invert_transformation(veh2world_per_cam_0[:3, :3], veh2world_per_cam_0[:3, 3])
+
+    for cam_i in range(len(CAMERAS)):
+        veh2world_per_cam = all_veh_poses_per_cam[:, cam_i] # ego vehicle to world 每个相机下车辆的全局位姿
+        world2veh_per_cam = np.stack([invert_transformation(v[:3, :3], v[:3, 3]) for v in veh2world_per_cam]) # world to ego vehicle
+        cam2veh = all_cam2veh[:, cam_i] # cam to ego 相机外参
+        veh2world = all_veh2world[:, cam_i] # ego to world 车辆的全局位姿
+
+        cam2veh = np.matmul(world2veh_per_cam, np.matmul(veh2world, cam2veh)) # cam to ego  -> cam to world -> cam to ego vehicle
+
+        vehi2veh0 = []
+        for i in range(1, len(veh2world_per_cam)):
+            veh2world_i = veh2world_per_cam[i]
+            vehi2veh0.append(world2veh_per_cam_0.dot(veh2world_i))
+        # for i in range(1, len(veh2world)):
+        #     veh2world_i = veh2world[i]
+        #     vehi2veh0.append(world2veh_per_cam_0.dot(veh2world_i))
+
+        vehi2veh0 = np.stack(vehi2veh0)
+        
+        pose_0 = np.eye(4)[None, ...]
+        vehi2veh0 = np.concatenate((pose_0, vehi2veh0))
+        all_vehi2veh0.append(vehi2veh0)
+
+        cam2veh0 = np.matmul(vehi2veh0, cam2veh) # waymo convention (FLU)
+        cam2veh0_FLU = cam2veh0
+
+        # waymo convention (FLU) to NeRF convention (RUB)
+        trans_mat = np.array([[[ 0,  0, -1,  0],
+                                [-1,  0,  0,  0],
+                                [0, 1,  0,  0],
+                                [0,  0,  0,  1]]])
+
+
+        cam2veh0_RUB = np.matmul(cam2veh0_FLU, trans_mat)
+        extrinsics.append(cam2veh0_RUB[:, None, ...])
+
+    all_vehi2veh0 = np.stack(all_vehi2veh0)
+    np.save(os.path.join(saving_dir, "vehi2veh0.npy"), all_vehi2veh0)
+
+    # [FRAME, CAM, 4, 4]
+    extrinsics = np.concatenate(extrinsics, axis=1) # RUB convention
+
+    extrinsics = extrinsics[:, :, :3, :4].reshape(args.frame_nums * len(CAMERAS), 3, 4) # [N, 3, 4]
+    all_intrinsic_matrices = all_intrinsic_matrices.reshape(args.frame_nums * len(CAMERAS), 3, 3)
+    all_distortions = all_distortions.reshape(args.frame_nums * len(CAMERAS), 4)
+    N = extrinsics.shape[0]
+    bounds = np.array([0.1, 999]).reshape(1,2).repeat(N, axis=0)
+    
+    cams_meta_data = np.concatenate(
+        [extrinsics.reshape(N, -1),
+         all_intrinsic_matrices.reshape(N, -1),
+         all_distortions.reshape(N, -1),
+         bounds.reshape(N, -1)],
+         axis = 1
+    )
+
+    np.save(os.path.join(saving_dir, 'cams_meta_waymo.npy'), cams_meta_data)
+
+
+    ########################## Getting shutter times from tfrecord ###########################################
+    print("Getting Shutter Times from tfrecord files")
+    save_path = os.path.join(saving_dir ,'shutters')
+    get_shutter(args.tfrecord_dir, save_path, start_frame=args.start_frame, end_frame=args.start_frame + args.frame_nums, normalize=True)
+
+    save_path = os.path.join(saving_dir ,'shutters_not_normalize')
+    get_shutter(args.tfrecord_dir, save_path, start_frame=args.start_frame, end_frame=args.start_frame + args.frame_nums, normalize=False)
+
+    # rename image files
+    for save_idx, img_index in enumerate(range(args.start_frame, args.start_frame + args.frame_nums)):
+        for key, value in CAMERAS.items():
+            img_path_from = os.path.join(saving_dir, "images_all", '%03d_%s.png'%(img_index, key))
+            img_path_to = os.path.join(saving_dir, "images", '%03d.png'%(save_idx*len(CAMERAS) + value))
+            shutil.copyfile(img_path_from, img_path_to)
+
+    valid_vehicles = data[(0,args.start_frame)]['camera_labels'][1].keys()
+    valid_vehicles = [key  for key in valid_vehicles if data[(0,args.start_frame)]['camera_labels'][1][key]['type'] == 1]
+
+    bboxes_dict = {}
+
+    for i,key in enumerate(valid_vehicles):
+        bboxes_dict[str(i)] = data[(0,args.start_frame)]['lidar_labels'][key]
+        bboxes_dict[str(i)]['cx'] = bboxes_dict[str(i)].pop('c_x')
+        bboxes_dict[str(i)]['cy'] = bboxes_dict[str(i)].pop('c_y')
+        bboxes_dict[str(i)]['cz'] = bboxes_dict[str(i)].pop('c_z')
+    
+    np.save(os.path.join(saving_dir, '3d_boxes.npy'), bboxes_dict)
+
+
+
+if __name__ == '__main__':
+    
+    main()

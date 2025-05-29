@@ -1,0 +1,15 @@
+Copyright 2025 MetaX Integrated Circuits (Shanghai) Co.,Ltd.
+Please see the LICENSE for the license for this project.
+
+The project contains third-party components with separate copyright notices and license terms. Your use of the source code for the these third-party components are subject to the terms and conditions of their licenses. 
+
+The following files may have been Modified by MetaX Integrated Circuits (Shanghai) Co., Ltd. in 2025.  
+
+tools/eval.py
+tools/train.py
+models/gaussians/vanilla.py
+models/nodes/rigid.py
+models/trainers/base.py
+models/modules.py
+configs/omnire.yaml
+datasets/tools/extract_masks.py
