@@ -11,7 +11,8 @@ This workflow significantly improves the diversity and coverage of autonomous dr
 
 Demo
 
-![demo](./imgs/demo.mp4)
+![demo](./imgs/demo.gif)<br/>
+Video Intro[▶️ Click to watch demo](https://www.bilibili.com/video/BV1xr7VzCEqH/?vd_source=cbf80b05653a971041da81c96bd54115)
 
 ## Available Solutions
 ### 1. Scene Reconstruction

@@ -12,8 +12,8 @@
 
 效果演示：
 
-![demo](./imgs/demo.mp4)
-
+![demo](./imgs/demo.gif)<br/>
+视频介绍[▶️ 点击这里观看演示视频](https://www.bilibili.com/video/BV1xr7VzCEqH/?vd_source=cbf80b05653a971041da81c96bd54115)
 ## 现有解决方案
 ### 1. 场景重建
 - **[基于3DGS场景重建](./SceneReconstruction/README_zh.md)** 利用3DGS对场景的重建能力，对城市街道场景进行前背景分离建模，刚体非刚体独立建模等方式，实现场景的动态高保真重建，能便捷地实现场景的编辑操作。
